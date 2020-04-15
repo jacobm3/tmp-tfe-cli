@@ -1,0 +1,514 @@
+#!/bin/sh
+
+## -------------------------------------------------------------------
+##
+## tfe: Use the Terraform Enterprise API to perform operations in TFE
+##
+## -------------------------------------------------------------------
+##
+## Copyright (c) 2018 HashiCorp. All Rights Reserved.
+##
+## This file is provided to you under the Mozilla Public License
+## Version 2.0 (the "License"); you may not use this file
+## except in compliance with the License.  You may obtain
+## a copy of the License at
+##
+##   https://www.mozilla.org/en-US/MPL/2.0/
+##
+## Unless required by applicable law or agreed to in writing,
+## software distributed under the License is distributed on an
+## "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+## KIND, either express or implied.  See the License for the
+## specific language governing permissions and limitations
+## under the License.
+##
+## -------------------------------------------------------------------
+
+# The following variables will be set for the purpose of aiding subcommands. All
+# bets are off for any other variables used in this script before subcommands
+# are executed.
+#
+# tfe_prefix
+# tfe_lib_dir
+# tfe_libexec_dir
+# tfe_cmd_dir
+# tfe_tar_verbose
+# tfe_curl_silent
+# tfe_address
+# tfe_org
+# tfe_workspace
+# tfe_token
+
+##
+## Utility function declarations
+##
+
+# Return (print) "$1\n$2\n." if $1 is not empty, "$2\n." if $1 is empty.
+# These "lists" always have an end-of-list marker, ".", if they are not empty.
+# This is to help track empty list values that would otherwise be \n
+# special characters that will get stripped by command substitution.
+
+# Usage:
+#   my_str_list="$(append "$my_str_list" "line")"
+# This will facilitate a later iteration, such as:
+#   printf "%s" "${my_str_list%.}" | while read line; do <operations with "$line">; done
+# Note that the list variable should have the end-of-list marker, ".",
+# removed when used.
+append () {
+    [ -n "$1" ] && printf "%s" "${1%.}"
+    printf "%s\n." "$2"
+}
+
+# Remove specified files
+cleanup () {
+    if [ -n "$1" ]; then
+        echo "$1" | while read f; do
+            echodebug "[DEBUG] cleaning up $f"
+            rm "$f" 2>&3
+            if [ 0 -ne $? ]; then
+                echoerr "Error cleaning up $f"
+                echoerr "$f"
+            fi
+        done
+    else
+        echodebug "[DEBUG] No file to clean up"
+    fi
+}
+
+# Usage description for options common to all subcommands
+tfe_usage_args () {
+cat << EOF
+ -name <NAME>         The name of the Terraform Enterprise workspace,
+                      formatted as "<ORGANIZATION>/<WORKSPACE>". If unspecified,
+                      uses the TFE_ORG and TFE_WORKSPACE environment variables.
+
+ -tfe-org <ORGANIZATION>
+                      The name of the Terraform Enterprise organization. If
+                      unspecified, uses the TFE_ORG environment variable.
+                      The -tfe-org and -tfe-workspace can be used as an
+                      alternative to specifying -name. The option specified
+                      last is the effective value used.
+
+ -tfe-workspace <WORKSPACE>
+                      The name of the Terraform Enterprise workspace. If
+                      unspecified, uses the TFE_WORKSPACE environment
+                      variable. The -tfe-org and -tfe-workspace can be used
+                      as an alternative to specifying -name. The option
+                      specified last is the effective value used.
+
+ -tfe-address <URL>   The address of your Terraform Enterprise instance.
+                      Defaults to the SaaS hostname at https://app.terraform.io
+
+ -token <TOKEN>       Access token for Terraform Enterprise API requests. If
+                      unspecified, uses the ATLAS_TOKEN environment variable.
+
+EOF
+}
+
+# Replace quotes and newlines with escape characters to prepare the
+# value for insertion into JSON.
+escape_value () {
+    printf '%s' "$1" | awk '
+    {
+        gsub(/"/,"\\\"")
+        gsub(/\\n/,"\\\\n")
+    }
+    NR == 1 {
+        value_line = $0
+    }
+    NR != 1 {
+        value_line = value_line "\\n" $0
+    }
+    END {
+        printf "%s", value_line
+    }'
+}
+
+
+# Given a parameter and a value determine if the value is valid.
+assign_arg () {
+    # Value must not be empty and must not start with '-' (e.g. there
+    # was no value, just another parameter), but allow values to be
+    # a single '-', as we use this to indicate the special case of
+    # unsetting something.
+    if ( [ -z "$2" ] || [ "${2#-}" != "$2" ] ) &&
+       [ "$2" != "-" ]; then
+        echoerr "Parameter $1 is missing a value"
+        # exit here will not terminate the script. Using PIPE
+        # to kill the process group will not produce a kill
+        # message
+        kill -s PIPE 0
+    else
+        echo $2
+    fi
+}
+
+# Given a parameter and, potentially, a value determine if the two
+# constitute a valid bool. If no value was given, the parameter was
+# used like a flag (-flag) instead of providing a value (-flag false).
+assign_bool () {
+    if [ ! "$2" ]; then
+        echo 1
+        if [ $# -eq 1 ]; then
+            return 0
+        else
+            return 1
+        fi
+    fi
+
+    case "$2" in
+        -*)
+            echo 1
+            return 0
+            ;;
+        true|1)
+            echo 1
+            return 1
+            ;;
+        false|0)
+            echo
+            return 1
+            ;;
+        *)
+            echo "$1 should be true or false. Got $2" 1>&2
+            kill -PIPE 0
+            ;;
+    esac
+}
+
+# Common options to curl. Fail on HTTP error codes.
+tfe_api_call () {
+    echodebug "[DEBUG] curl args: $@"
+    if resp="$(curl -f $tfe_curl_silent \
+                 --header "Authorization: Bearer $tfe_token" \
+                 --header "Content-Type: application/vnd.api+json" \
+                 $@)"; then
+        echodebug "[DEBUG] API request succeeded with exit code $?. Response:"
+        echodebug "$resp"
+
+        printf "%s" "$resp"
+        next_page="$(printf "%s" "$resp" | jq -r '.meta.pagination."next-page"')"
+        if [ -n "$next_page" ] && [ "$next_page" != null ]; then
+            echodebug "[DEBUG] Next page: $next_page"
+            next_link="$(printf "%s" "$resp" | jq -r '.links.next')"
+            echodebug "[DEBUG] Next link: $next_link"
+            tfe_api_call "$next_link"
+        fi
+    else
+        echodebug "[DEBUG] API request failed with exit code $?. Response:"
+        echodebug "$resp"
+
+        return 1
+    fi
+}
+
+# Check the version of terraform in use. Commands can use this
+# to verify that their use of Terraform will go as expected.
+tf_version_required () {
+    if [ $# -ne 3 ]; then
+        echoerr "Unable to check the version of Terraform. This is a bug."
+        exit 1
+    fi
+
+    # Verify the terraform command is present
+    if [ -z "$(command -v terraform)" ]; then
+        echoerr "The terraform command must be installed"
+        exit 1
+    fi
+
+    # Test the version numbers provided in the output with the three arguments
+    if ! terraform -version | awk -v major=$1 -v minor=$2 -v micro=$3 -F. '
+        NR==1 {
+            sub(/[^[0-9]*/, "", $1)
+            if($1 > major) exit 0
+            if($1 == major && $2 > minor) exit 0
+            if($1 == major && $2 == minor && $3 >= micro) exit 0
+            exit 1
+        }'
+    then
+        echoerr "This operation requires at least Terraform $1.$2.$3"
+        exit 1
+    fi
+}
+
+check_required () {
+    if [ 0 -eq $# ]; then
+        check_for="tfe_org tfe_workspace tfe_token tfe_address"
+    else
+        check_for="$*"
+    fi
+
+    missing=0
+    for i in $check_for; do
+        case "$i" in
+            tfe_org)
+                if [ -z "$tfe_org" ]; then
+                    missing=1
+                    echoerr 'TFE organization required.'
+                    echoerr 'Set with $TFE_ORG or use -name'
+                    echoerr
+                fi
+            ;;
+            tfe_workspace)
+                if [ -z "$tfe_workspace" ]; then
+                    missing=1
+                    echoerr 'TFE workspace required.'
+                    echoerr 'Set with $TFE_WORKSPACE or use -name'
+                    echoerr
+                fi
+            ;;
+            tfe_token)
+                if [ -z "$tfe_token" ]; then
+                    missing=1
+                    echoerr 'TFE API token required.'
+                    echoerr 'Set with $TFE_TOKEN, -token, or $ATLAS_TOKEN'
+                    echoerr
+                fi
+            ;;
+            tfe_address)
+                # This really shouldn't happen. Someone would have to
+                # explicitly pass in an empty string to the command line
+                # argument.
+                if [ -z "$tfe_address" ]; then
+                    missing=1
+                    echoerr 'TFE address required.'
+                    echoerr 'Set with -tfe-address or $TFE_URL'
+                    echoerr
+                fi
+            ;;
+        esac
+    done
+    return $missing
+}
+
+is_common_opt () {
+    for common_opt in -name -tfe-address -tfe-org -tfe-workspace -token; do
+        if [ "$1" = "$common_opt" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+##
+## Program begins here
+##
+
+# Check for commands that must be present to function
+
+for required_cmd in jq curl readlink; do
+    if [ -z "$(command -v $required_cmd)" ]; then
+        echo "The $required_cmd command must be installed" 1>&2
+        exit 1
+    fi
+done
+
+# Use TMPDIR if it is set. If not, set it to /tmp
+if [ -z "$TMPDIR" ]; then
+    TMPDIR=/tmp
+fi
+
+# Strip the trailing / from TMPDIR if there is one
+TMPDIR="$(echo "$TMPDIR" | sed 's#/$##')"
+
+# Need to determine the script location and prefix to the needed lib directory.
+# The prefix should be the directory that contains the bin and lib directories.
+# i.e. /users/username/gitclones/tfe-cli (contains lib/tfe/)
+# or   /usr (contains bin/tfe and lib/tfe/)
+
+# Note that this is not POSIX but portable to many systems with nearly any
+# kind of implementation of readlink. We already require jq and curl, so
+# requiring readline is not that big of a deal.
+
+# Get the command used to start this script
+target=$0
+
+# If executing via a series of symlinks, resolve them all the way back to the
+# script itself. Some danger here of infinitely cycling.
+while [ -h "$target" ]; do
+    link=$(readlink "$target")
+    if [ "$(echo "$link" | cut -c -1)" = "/" ]; then
+        # link path is absolute, just need to follow it
+        target="$link"
+    else
+        # link path is relative, need to relatively follow it
+        target="${target%/*}"
+        target="$target/$link"
+    fi
+done
+
+# Now target should be like the following, where 'script' is not a symlink:
+# /some/path/to/the/actual/script
+
+# Get the script name by removing everything up to the last /
+bin_name="${target##*/}"
+
+# Get the script path, go there, and resolve the full path of symlinks with pwd
+tfe_prefix=$(cd ${target%/$bin_name} && pwd -P)
+
+# Remove /bin and /sbin from the prefix if there is one (i.e. /usr/bin)
+tfe_prefix=${tfe_prefix%/bin}
+tfe_prefix=${tfe_prefix%/sbin}
+
+# tfe_prefix should now be to something like /usr or
+# /path/to/gitclone/tfe-cli
+
+# Set some additional convenience variables
+tfe_lib_dir="$tfe_prefix/lib/tfe"
+tfe_cmd_dir="$tfe_lib_dir/commands"
+tfe_libexec_dir="$tfe_prefix/libexec/tfe"
+tfe_payload_dir="$tfe_prefix/share/tfe/commands"
+
+# Load required functions
+if [ ! -f "$tfe_lib_dir/echofuncs" ]; then
+    echo "Unable to load required functions from:" 1>&2
+    echo "$tfe_lib_dir/echofuncs" 1>&2
+fi
+
+# Provides echoerr and echodebug
+. "$tfe_lib_dir/echofuncs"
+
+if [ ! -f "$tfe_lib_dir/subcmd" ]; then
+    echoerr "Unable to load required functions from:"
+    echoerr "$tfe_lib_dir/subcmd"
+fi
+
+# Provides execute_subcmd
+. "$tfe_lib_dir/subcmd"
+
+if [ -n "$TF_LOG" ]; then
+    # Debugging. Print command errors and make them verbose
+    tfe_tar_verbose=v
+    tfe_curl_silent=
+    exec 3>&2
+else
+    # Not debugging. Shut everyting up.
+    tfe_tar_verbose=
+    tfe_curl_silent="-s"
+    exec 3>/dev/null
+fi
+
+# Allow setting the URL to TFE with TFE_URL
+tfe_address=${TFE_URL:-"https://app.terraform.io"}
+
+# Allow setting the TFE organization with TFE_ORG
+tfe_org="$TFE_ORG"
+
+# Allow setting the TFE workspace with TFE_WORKSPACE
+tfe_workspace="$TFE_WORKSPACE"
+
+# Prefer TFE_TOKEN, fall back to ATLAS_TOKEN.
+tfe_token="$TFE_TOKEN"
+if [ -z "$tfe_token" ]; then
+    tfe_token="$ATLAS_TOKEN"
+fi
+
+echodebug "[DEBUG] $PWD"
+echodebug "[DEBUG] $0 $*"
+
+# Make sure there's a commands directory
+if [ ! -d "$tfe_cmd_dir" ]; then
+    echoerr "Error obtaining commands from:"
+    echoerr "$tfe_cmd_dir"
+    exit 1
+fi
+
+# Make sure we can load help so it is always available.
+# If not, that's a red flag.
+if [ -f "$tfe_cmd_dir/help" ] ; then
+    . "$tfe_cmd_dir/help"
+else
+    echoerr "Unable to load help command from:"
+    echoerr "$tfe_cmd_dir/help"
+    exit 1
+fi
+
+# Now, if we haven't exited:
+#   First argument is a command
+#   Additional arguments are parameters to the command to be run
+
+# Comb through options for name, token, and address while building
+# a list of other arguments to go to the subcommand
+
+# The only "safe" operations to perform on the provided list of arguments in $@
+# is to iterate over them or remove args from the beginning using shift. All
+# other kinds of operations tend to strip away the proper quoting for arguments
+# provided with spaces, so we're unable to actually _remove_ the common options
+# from $@.
+
+# When a common option is found as an argument, the following argument in the
+# next iteration contains the value.
+
+assign=
+for arg in "$@"; do
+    case "$assign" in
+        -tfe-address)
+            tfe_address="$arg"
+            assign=
+            continue
+            ;;
+        -name)
+            tfe_name="$arg"
+
+            if ! echo "$tfe_name" | grep / >/dev/null 2>&1; then
+                echoerr "Format for name should be <ORGANIZATION>/<WORKSPACE>"
+                echoerr "Received: $tfe_name"
+                exit 1
+            fi
+
+            # Separate the org and workspace in name
+            tfe_org="${tfe_name%/*}"
+            tfe_workspace="${tfe_name#*/}"
+
+            if [ -z "$tfe_org" ]; then
+                echoerr "Format for name should be <ORGANIZATION>/<WORKSPACE>"
+                echoerr "Given name resulted in empty org: $tfe_name"
+                exit 1
+            fi
+
+            if [ -z "$tfe_workspace" ]; then
+                echoerr "Format for name should be <ORGANIZATION>/<WORKSPACE>"
+                echoerr "Given name resulted in empty workspace: $tfe_name"
+                exit 1
+            fi
+            assign=
+            continue
+            ;;
+        -tfe-org)
+            tfe_org="$arg"
+            assign=
+            continue
+            ;;
+        -tfe-workspace)
+            tfe_workspace="$arg"
+            assign=
+            continue
+            ;;
+        -token)
+            tfe_token="$arg"
+            assign=
+            continue
+            ;;
+    esac
+
+    if is_common_opt "$arg"; then
+        assign="$arg"
+    fi
+done
+
+echodebug "[DEBUG] tfe_address: $tfe_address"
+echodebug "[DEBUG] tfe_org: $tfe_org"
+echodebug "[DEBUG] tfe_workspace: $tfe_workspace"
+
+if [ -n "$tfe_token" ]; then
+    echodebug "[DEBUG] tfe_token: (not empty)"
+else
+    echodebug "[DEBUG] tfe_token: (empty)"
+fi
+
+# Run the subcommand
+execute_subcmd "$bin_name" "$tfe_cmd_dir" "$@"
+
+# Exit with the exit code returned by the command
+exit $?
+
